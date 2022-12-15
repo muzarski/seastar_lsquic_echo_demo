@@ -16,7 +16,7 @@ using namespace zpp;
 static SSL_CTX *s_ssl_ctx;
 
 static int
-tut_log_buf (void *ctx, const char *buf, size_t len) {
+tut_log_buf (void *ctx, const char *buf, std::size_t len) {
     FILE *out = static_cast<FILE *>(ctx);
     fwrite(buf, 1, len, out);
     fflush(out);
@@ -75,10 +75,6 @@ static void tut_server_on_read(lsquic_stream *stream, lsquic_stream_ctx_t *h) {
             log("Read newline or filled buffer, switch to writing");
             tssc->tssc_buf[tssc->tssc_sz] = '\0';
             std::cerr << "Message from stream is " << tssc->tssc_buf << "\n";
-//            std::reverse(
-//                    std::begin(tssc->tssc_buf),
-//                    std::end(tssc->tssc_buf) - (buf[0] == '\n' ? 1 : 0)
-//            );
             ::lsquic_stream_wantread(stream, 0);
             ::lsquic_stream_wantwrite(stream, 1);
         }
@@ -172,8 +168,9 @@ private:
             if (diff >= LSQUIC_DF_CLOCK_GRANULARITY) {
                 timeout = diff / 1000;
             }
-            else if (diff <= 0)
+            else if (diff <= 0) {
                 timeout = 0;
+            }
             else {
                 timeout = LSQUIC_DF_CLOCK_GRANULARITY / 1000;
             }
@@ -194,8 +191,12 @@ private:
         memcpy(buf, datagram.get_data().fragment_array()->base, datagram.get_data().len());
         buf[datagram.get_data().len()] = '\0';
 
+        std::cerr << "l1 " << datagram.get_dst() << "\n";
+        std::cerr << "l2 " << channel.local_address() << "\n";
+        std::cerr << "r " << datagram.get_src() << "\n";
+
         int packet_in_res = lsquic_engine_packet_in(engine, reinterpret_cast<const unsigned char *>(buf),
-                                                    datagram.get_data().len(), &datagram.get_dst().as_posix_sockaddr(),
+                                                    datagram.get_data().len(), &channel.local_address().as_posix_sockaddr(),
                                                     &datagram.get_src().as_posix_sockaddr(), this, 0);
 
         if (packet_in_res == 0) {
@@ -222,8 +223,8 @@ private:
             std::memcpy(data.get(), specs[i].iov->iov_base, specs[i].iov->iov_len);
             server->udp_send_queue = server->udp_send_queue.then(
                     [server, data = std::move(data), dst = *specs[i].dest_sa, data_len = specs[i].iov->iov_len] () {
-                        std::cerr << "sending " << data_len << " bytes of data via udp channel.\n";
                         seastar::socket_address addr(*(sockaddr_in *) &dst);
+                        std::cerr << "sending " << data_len << " bytes of data to " << addr << " via udp channel.\n";
                         return server->channel.send(addr, seastar::temporary_buffer<char>(data.get(), data_len));
             });
         }
@@ -307,8 +308,8 @@ seastar::future<> submit_to_cores(uint16_t port) {
             [port] (unsigned core) {
         return seastar::smp::submit_to(core, [port] () {
             Server _server(port);
-            _server.init_lsquic();
             return seastar::do_with(std::move(_server), [] (Server &server) {
+                server.init_lsquic();
                 return server.service_loop();
             });
         });
