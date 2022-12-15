@@ -4,7 +4,7 @@ project(seastar_echo_quic)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_COMPILER /usr/bin/clang++)
 set(CMAKE_CXX_STANDARD 20)
-#set(CMAKE_CXX_FLAGS "-O3")
+set(CMAKE_CXX_FLAGS "-g -Wall -Wextra -Wshadow -Wpedantic")
 
 find_package(Seastar REQUIRED)
 
@@ -61,13 +61,27 @@ list(APPEND LIBS ${LSQUIC_LIB} ${BORINGSSL_SSL_LIB} ${BORINGSSL_CRYPTO_LIB} Seas
 
 set(DATAGRAMSIZE 3000)
 
-add_executable(echo_server src/echo_server.cpp src/ssl_handler.cpp)
-target_include_directories(echo_server PRIVATE ${INCLUDE_FILES_DIR})
-target_link_libraries(echo_server ${LIBS})
-target_compile_definitions(echo_server PRIVATE DATAGRAM_SIZE=${DATAGRAMSIZE})
+set(SERVER_EXEC_NAME echo_server)
+set(CLIENT_EXEC_NAME echo_client)
 
-# message(WARNING "Client is not working yet. Ignore it...")
-add_executable(echo_client src/echo_client.cpp)
-target_include_directories(echo_client PRIVATE ${INCLUDE_FILES_DIR})
-target_link_libraries(echo_client ${LIBS})
-target_compile_definitions(echo_client PRIVATE DATAGRAM_SIZE=${DATAGRAMSIZE})
+set(SERVER_SRC
+    src/echo_server.cpp
+    src/ssl_handler.cpp
+)
+set(CLIENT_SRC
+    src/echo_client.cpp
+    src/client.cpp
+    src/client_callbacks.cpp
+)
+
+add_executable(${SERVER_EXEC_NAME} ${SERVER_SRC})
+target_include_directories(${SERVER_EXEC_NAME} PRIVATE ${INCLUDE_FILES_DIR})
+target_link_libraries(${SERVER_EXEC_NAME} ${LIBS})
+target_compile_definitions(${SERVER_EXEC_NAME} PRIVATE DATAGRAM_SIZE=${DATAGRAMSIZE})
+target_compile_definitions(${SERVER_EXEC_NAME} PRIVATE PROJECT_ROOT_PATH="${PROJECT_SOURCE_DIR}")
+
+add_executable(${CLIENT_EXEC_NAME} ${CLIENT_SRC})
+target_include_directories(${CLIENT_EXEC_NAME} PRIVATE ${INCLUDE_FILES_DIR})
+target_link_libraries(${CLIENT_EXEC_NAME} ${LIBS})
+target_compile_definitions(${CLIENT_EXEC_NAME} PRIVATE DATAGRAM_SIZE=${DATAGRAMSIZE})
+target_compile_definitions(${CLIENT_EXEC_NAME} PRIVATE PROJECT_ROOT_PATH="${PROJECT_SOURCE_DIR}")
