@@ -13,6 +13,8 @@
 using namespace seastar::net;
 using namespace zpp;
 
+const size_t QUIC_MESSAGE_SIZE = 10000000;
+
 static SSL_CTX *s_ssl_ctx;
 
 static int
@@ -24,21 +26,35 @@ tut_log_buf (void *ctx, const char *buf, std::size_t len) {
 }
 static const struct lsquic_logger_if logger_if = { tut_log_buf, };
 
+
+struct lsquic_conn_ctx {
+    size_t bytes_written;
+    size_t max_bytes_written;
+};
+
+
 static lsquic_conn_ctx_t *tut_server_on_new_conn(void *stream_if_ctx, lsquic_conn *conn) {
     log("Created a new connection");
-    return nullptr;
+    auto *conn_ctx = new lsquic_conn_ctx();
+    conn_ctx->bytes_written = 0;
+    conn_ctx->max_bytes_written = 1000000000;
+    return conn_ctx;
 }
 
 
 static void tut_server_on_conn_closed(lsquic_conn_t *conn) {
     log("Closed connection");
+    lsquic_conn_ctx *conn_ctx = lsquic_conn_get_ctx(conn);
+    free(conn_ctx);
+    lsquic_conn_set_ctx(conn, nullptr);
 }
 
 
 struct tut_server_stream_ctx {
-    std::size_t     tssc_sz;            /* Number of bytes in tsc_buf */
+    std::size_t     bytes_written;            /* Number of bytes in tsc_buf */
+    std::size_t     max_bytes_written;
     off_t           tssc_off;           /* Number of bytes written to stream */
-    unsigned char   tssc_buf[0x100];    /* Bytes read in from client */
+    unsigned char   tssc_buf[QUIC_MESSAGE_SIZE];    /* Bytes read in from client */
 };
 
 
@@ -53,9 +69,8 @@ static lsquic_stream_ctx_t *tut_server_on_new_stream(void *stream_if_ctx, lsquic
         ::lsquic_conn_abort(::lsquic_stream_conn(stream));
         return nullptr;
     }
-
-    tssc->tssc_sz = 0;
-    tssc->tssc_off = 0;
+    
+    std::fill(tssc->tssc_buf, tssc->tssc_buf + QUIC_MESSAGE_SIZE, 'a');
     ::lsquic_stream_wantread(stream, 1);
     log("Created a new echo stream -- want to read");
     return reinterpret_cast<lsquic_stream_ctx_t*>(tssc);
@@ -65,25 +80,15 @@ static lsquic_stream_ctx_t *tut_server_on_new_stream(void *stream_if_ctx, lsquic
 static void tut_server_on_read(lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     auto *const tssc = reinterpret_cast<tut_server_stream_ctx *const>(h);
     unsigned char buf[1];
-
+    
     ssize_t nread = ::lsquic_stream_read(stream, buf, sizeof(buf));
 
     if (nread > 0) {
-        tssc->tssc_buf[tssc->tssc_sz] = buf[0];
-        ++tssc->tssc_sz;
-        if (buf[0] == '\n' || tssc->tssc_sz == sizeof(tssc->tssc_buf)) {
-            log("Read newline or filled buffer, switch to writing");
-            tssc->tssc_buf[tssc->tssc_sz] = '\0';
-            std::cerr << "Message from stream is " << tssc->tssc_buf << "\n";
-            ::lsquic_stream_wantread(stream, 0);
-            ::lsquic_stream_wantwrite(stream, 1);
-        }
+        std::cerr << "Somehow received non-zero value from lsquic_stream_read: " << nread << std::endl;
     } else if (nread == 0) {
         log("Read EOF");
         ::lsquic_stream_shutdown(stream, 0);
-        if (tssc->tssc_sz) {
-            ::lsquic_stream_wantwrite(stream, 1);
-        }
+        lsquic_stream_wantwrite(stream, 1);
     }
     else {
         /* This should not happen */
@@ -97,30 +102,22 @@ static void tut_server_on_write(lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     using std::literals::string_literals::operator""s;
 
     auto *const tssc = reinterpret_cast<tut_server_stream_ctx *const>(h);
-    ssize_t nw = ::lsquic_stream_write(stream, tssc->tssc_buf + tssc->tssc_off,
-                                       tssc->tssc_sz - tssc->tssc_off);
+    ssize_t nw = ::lsquic_stream_write(stream, tssc->tssc_buf,
+                                       QUIC_MESSAGE_SIZE);
+
+    lsquic_conn *conn = lsquic_stream_conn(stream);
+    lsquic_conn_ctx_t *conn_ctx = lsquic_conn_get_ctx(conn);
 
     if (nw > 0) {
-        tssc->tssc_off += nw;
-        if (tssc->tssc_off == tssc->tssc_sz) {
-            log("Wrote all "s + std::to_string(nw) + " bytes to the stream");
-            std::cerr << "Wrote " << tssc->tssc_buf << "\n";
-
-            // The exemplary client from https://github.com/litespeedtech/lsquic/blob/master/bin/echo_client.c
-            // uses only one stream. If we closed the stream, the client would then close the connection.
-            // We have to flush the stream and tell the engine that we want to switch to reading.
-            lsquic_stream_flush(stream);
-            ::lsquic_stream_wantwrite(stream, 0);
-            ::lsquic_stream_wantread(stream, 1);
-
-            // However, the client from https://github.com/dtikhonov/lsquic-tutorial uses one stream per message.
-            // In this case we want to close the stream (send the `fin` byte).
-            // ::lsquic_stream_close(stream);
-        } else {
-            log("Wrote all "s + std::to_string(nw) + " bytes to the stream; "
-                "still have " + std::to_string(tssc->tssc_sz - tssc->tssc_off) + " bytes to write");
+        // std::cerr << "Written " << nw << " bytes to stream" << std::endl;
+        conn_ctx->bytes_written += nw;
+        // lsquic_stream_flush(stream);
+        if (conn_ctx->bytes_written >= conn_ctx->max_bytes_written) {
+            log("Finished writing to stream");
+            ::lsquic_stream_shutdown(stream, 1);
+            lsquic_conn_close(conn);
         }
-    } else {
+    } else if (nw == -1) {
         /* When `on_write()' is called, the library guarantees that at least
          * something can be written.  If not, that's an error whether 0 or -1
          * is returned.
@@ -153,7 +150,7 @@ private:
     seastar::timer<> timer;
 
     seastar::future<> timer_expired() {
-        std::cerr << "Timer expired\n";
+        // std::cerr << "Timer expired\n";
         return process_conns();
     }
 
@@ -161,7 +158,7 @@ private:
         int diff;
         int64_t timeout;
 
-        std::cerr << "Ticking engine...\n";
+        // std::cerr << "Ticking engine...\n";
         lsquic_engine_process_conns(engine);
 
         if (lsquic_engine_earliest_adv_tick(engine, &diff)) {
@@ -175,44 +172,44 @@ private:
                 timeout = LSQUIC_DF_CLOCK_GRANULARITY / 1000;
             }
 
-            std::cerr << "There will be tickable connections in " << timeout << " millis. Scheduling the timer.\n";
+            // std::cerr << "There will be tickable connections in " << timeout << " millis. Scheduling the timer.\n";
             timer.rearm(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout), std::nullopt);
         }
         else {
-            std::cerr << "There are NO tickable connections.\n";
+            // std::cerr << "There are NO tickable connections.\n";
         }
         return seastar::make_ready_future<>();
     }
 
     seastar::future<> handle_receive(udp_datagram &&datagram) {
-        std::cerr << "Read " << datagram.get_data().len() << " bytes from udp channel\n";
+        // std::cerr << "Read " << datagram.get_data().len() << " bytes from udp channel\n";
 
         char buf[DATAGRAM_SIZE];
         memcpy(buf, datagram.get_data().fragment_array()->base, datagram.get_data().len());
         buf[datagram.get_data().len()] = '\0';
 
-        std::cerr << "l1 " << datagram.get_dst() << "\n";
-        std::cerr << "l2 " << channel.local_address() << "\n";
-        std::cerr << "r " << datagram.get_src() << "\n";
+//        std::cerr << "l1 " << datagram.get_dst() << "\n";
+//        std::cerr << "l2 " << channel.local_address() << "\n";
+//        std::cerr << "r " << datagram.get_src() << "\n";
 
         int packet_in_res = lsquic_engine_packet_in(engine, reinterpret_cast<const unsigned char *>(buf),
                                                     datagram.get_data().len(), &channel.local_address().as_posix_sockaddr(),
                                                     &datagram.get_src().as_posix_sockaddr(), this, 0);
 
-        if (packet_in_res == 0) {
-            std::cerr << "Packet processed by a connection\n";
-        } else if (packet_in_res == 1) {
-            std::cerr << "Packet processed, but not by a connection\n";
-        }
-        else {
-            std::cerr << "Packet processing failed\n";
-        }
+//        if (packet_in_res == 0) {
+//            std::cerr << "Packet processed by a connection\n";
+//        } else if (packet_in_res == 1) {
+//            std::cerr << "Packet processed, but not by a connection\n";
+//        }
+//        else {
+//            std::cerr << "Packet processing failed\n";
+//        }
 
         return process_conns();
     }
 
     static int tut_packets_out(void *packets_out_ctx, const lsquic_out_spec *specs, unsigned int count) {
-        std::cerr << "In packets_out callback... - " << count << " packages to send\n";
+        // std::cerr << "In packets_out callback... - " << count << " packages to send\n";
         if (count == 0) {
             return 0;
         }
@@ -224,7 +221,7 @@ private:
             server->udp_send_queue = server->udp_send_queue.then(
                     [server, data = std::move(data), dst = *specs[i].dest_sa, data_len = specs[i].iov->iov_len] () {
                         seastar::socket_address addr(*(sockaddr_in *) &dst);
-                        std::cerr << "sending " << data_len << " bytes of data to " << addr << " via udp channel.\n";
+                        // std::cerr << "sending " << data_len << " bytes of data to " << addr << " via udp channel.\n";
                         return server->channel.send(addr, seastar::temporary_buffer<char>(data.get(), data_len));
             });
         }
@@ -250,8 +247,8 @@ public:
             fail("Initialization of the engine has failed");
         }
 
-        lsquic_set_log_level("debug");
-        lsquic_logger_init(&logger_if, stderr, LLTS_HHMMSSUS);
+//        lsquic_set_log_level("debug");
+//        lsquic_logger_init(&logger_if, stderr, LLTS_HHMMSSUS);
 
         const char *cert_file = "../ssl/mycert-cert.pem";
         const char *key_file = "../ssl/mycert-key.pem";
@@ -295,7 +292,7 @@ public:
            return timer_expired();
         });
         return seastar::keep_doing([this] () {
-            std::cerr << "Waiting for some input...\n";
+            // std::cerr << "Waiting for some input...\n";
             return channel.receive().then([this] (udp_datagram datagram) {
                 return handle_receive(std::move(datagram));
             });
@@ -307,7 +304,8 @@ seastar::future<> submit_to_cores(uint16_t port) {
     return seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
             [port] (unsigned core) {
         return seastar::smp::submit_to(core, [port] () {
-            Server _server(port);
+            std::cerr << "INITIALIZING SERVER WITH PORT: " << port + seastar::this_shard_id() << " ON CORE: " << seastar::this_shard_id() << "\n";
+            Server _server(port + seastar::this_shard_id());
             return seastar::do_with(std::move(_server), [] (Server &server) {
                 server.init_lsquic();
                 return server.service_loop();

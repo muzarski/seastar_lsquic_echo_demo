@@ -9,8 +9,12 @@
 
 #include <lsquic/lsquic.h>
 
+const size_t MAX_UDP_PAYLOAD_SIZE = 65507;
+
 using namespace seastar::net;
 using namespace zpp;
+
+bool connection_closed = false;
 
 static int tut_log_buf (void *ctx, const char *buf, size_t len) {
     FILE *out = static_cast<FILE *>(ctx);
@@ -40,13 +44,16 @@ void Client::tut_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status
             log("handshake failed");
             break;
     }
-
-    lsquic_conn_make_stream(conn);
+    
+    for (size_t i = 0; i < 1000; ++i) {
+        lsquic_conn_make_stream(conn);
+    }
 }
 
 
 void Client::tut_client_on_conn_closed (struct lsquic_conn *conn) {
     log("client connection closed -- stop reading from socket");
+    connection_closed = true;
 }
 
 
@@ -69,8 +76,6 @@ lsquic_stream_ctx_t* Client::tut_client_on_new_stream (void *stream_if_ctx, stru
 
     auto *stream_ctx = new lsquic_stream_ctx{};
 
-    std::cerr << "size: " << sizeof(*stream_ctx) << std::endl;
-
     stream_ctx->client = client;
     stream_ctx->stream = stream;
     stream_ctx->write_buf_off = 0;
@@ -78,8 +83,8 @@ lsquic_stream_ctx_t* Client::tut_client_on_new_stream (void *stream_if_ctx, stru
 
     client->stream = stream;
 
-    client->can_read_stdin = true;
-
+    lsquic_stream_shutdown(stream, 1); // don't write 
+    lsquic_stream_wantread(stream, 1); // want to read
     std::cerr << "Returning stream context" << std::endl;
     return stream_ctx;
 }
@@ -87,23 +92,16 @@ lsquic_stream_ctx_t* Client::tut_client_on_new_stream (void *stream_if_ctx, stru
 
 /* Echo whatever comes back from server, no verification */
 void Client::tut_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
-    char buf[1];
+    static char buf[MAX_UDP_PAYLOAD_SIZE];
 
     ssize_t nread = ::lsquic_stream_read(stream, buf, sizeof(buf));
 
     if (nread > 0) {
-        h->read_buf[h->read_buf_off] = buf[0];
-        ++h->read_buf_off;
-        if (buf[0] == '\n' || h->read_buf_off == sizeof(h->read_buf)) {
-            log("Read newline or filled buffer, switch to writing");
-            h->read_buf[h->read_buf_off] = '\0';
-            std::cerr << "Received echo: " << h->read_buf << "\n";
-            ::lsquic_stream_wantread(stream, 0);
-
-            h->client->can_read_stdin = true;
-        }
+        // std::cerr << "Read " << nread << " bytes from stream " << lsquic_stream_id(stream) << std::endl;
+        h->client->bytes_read += nread;
     } else if (nread == 0) {
         log("Read EOF");
+        lsquic_stream_wantread(stream, 0);
         ::lsquic_stream_shutdown(stream, 0);
     }
     else {
@@ -136,24 +134,8 @@ void Client::tut_client_on_close (struct lsquic_stream *stream, lsquic_stream_ct
 }
 
 
-seastar::future<> Client::read_stdin_and_write_to_stream() {
-    std::cerr << "Reading from stdin...\n";
-    std::string s;
-    std::cin >> s;
-
-    lsquic_stream_ctx_t *stream_ctx = lsquic_stream_get_ctx(stream);
-
-    stream_ctx->write_buf_off = s.size();
-    memcpy(stream_ctx->write_buf, s.c_str(), s.size());
-    stream_ctx->write_buf[stream_ctx->write_buf_off++] = '\n';
-    lsquic_stream_wantwrite(stream_ctx->stream, 1);
-
-    return process_conns();
-}
-
-
 seastar::future<> Client::timer_expired() {
-    std::cerr << "Timer expired\n";
+    // std::cerr << "Timer expired\n";
     return process_conns();
 }
 
@@ -162,7 +144,7 @@ seastar::future<> Client::process_conns() {
     int diff;
     int64_t timeout;
 
-    std::cerr << "Ticking engine...\n";
+    // std::cerr << "Ticking engine...\n";
     lsquic_engine_process_conns(engine);
 
     if (lsquic_engine_earliest_adv_tick(engine, &diff)) {
@@ -176,11 +158,11 @@ seastar::future<> Client::process_conns() {
             timeout = LSQUIC_DF_CLOCK_GRANULARITY / 1000;
         }
 
-        std::cerr << "There will be tickable connections in " << timeout << " millis. Scheduling the timer.\n";
+        // std::cerr << "There will be tickable connections in " << timeout << " millis. Scheduling the timer.\n";
         timer.rearm(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout), std::nullopt);
     }
     else {
-        std::cerr << "There are NO tickable connections.\n";
+        // std::cerr << "There are NO tickable connections.\n";
     }
 
     return seastar::make_ready_future<>();
@@ -188,7 +170,7 @@ seastar::future<> Client::process_conns() {
 
 
 seastar::future<> Client::handle_receive(udp_datagram &&datagram) {
-    std::cerr << "Read " << datagram.get_data().len() << " bytes from udp channel\n";
+    // std::cerr << "Read " << datagram.get_data().len() << " bytes from udp channel\n";
 
     char buf[DATAGRAM_SIZE];
     memcpy(buf, datagram.get_data().fragment_array()->base, datagram.get_data().len());
@@ -198,35 +180,35 @@ seastar::future<> Client::handle_receive(udp_datagram &&datagram) {
                                                 datagram.get_data().len(), &channel.local_address().as_posix_sockaddr(),
                                                 &datagram.get_src().as_posix_sockaddr(), this, 0);
 
-    if (packet_in_res == 0) {
-        std::cerr << "Packet processed by a connection\n";
-    } else if (packet_in_res == 1) {
-        std::cerr << "Packet processed, but not by a connection\n";
-    }
-    else {
-        std::cerr << "Packet processing failed\n";
-    }
-
-    if (can_read_stdin) {
-        can_read_stdin = false;
-        return read_stdin_and_write_to_stream();
-    }
+//    if (packet_in_res == 0) {
+//        std::cerr << "Packet processed by a connection\n";
+//    } else if (packet_in_res == 1) {
+//        std::cerr << "Packet processed, but not by a connection\n";
+//    }
+//    else {
+//        std::cerr << "Packet processing failed\n";
+//    }
 
     return process_conns();
 }
 
 
 seastar::future<> Client::read_udp() {
-    return seastar::keep_doing([this] {
-        return channel.receive().then([this] (udp_datagram datagram) {
+    return seastar::do_until([this] { return connection_closed; }, [this] {
+        return channel.receive().then([this](udp_datagram &&datagram) {
             return handle_receive(std::move(datagram));
         });
+    }).then([this] {
+        std::cerr << "Connection closed, closing the channel\n";
+        timer.cancel();
+        status_timer.cancel();
+        return channel.close();
     });
 }
 
 
 int Client::tut_packets_out(void *packets_out_ctx, const lsquic_out_spec *specs, unsigned int count) {
-    std::cerr << "in packets out... - " << count << " packages to send\n";
+    // std::cerr << "in packets out... - " << count << " packages to send\n";
     if (count == 0) {
         return 0;
     }
@@ -238,7 +220,7 @@ int Client::tut_packets_out(void *packets_out_ctx, const lsquic_out_spec *specs,
         client->udp_send_queue = client->udp_send_queue.then(
                 [client, data = std::move(data), dst = *specs[i].dest_sa, data_len = specs[i].iov->iov_len] () {
                     seastar::socket_address addr(*(sockaddr_in *) &dst);
-                    std::cerr << "sending " << data_len << " bytes of data to " << addr << "\n";
+                    // std::cerr << "sending " << data_len << " bytes of data to " << addr << "\n";
                     return client->channel.send(client->server_address,
                                                 seastar::temporary_buffer<char>(data.get(), data_len));
                 });
@@ -252,6 +234,7 @@ Client::Client(const std::string &host, std::uint16_t port) :
     channel(seastar::make_udp_channel()),
     server_address(seastar::ipv4_addr(host, port)),
     timer(),
+    status_timer(),
     udp_send_queue(seastar::make_ready_future<>()),
     read_udp_future(seastar::make_ready_future<>()),
     client_flow_loop_future(seastar::make_ready_future<>()) {
@@ -264,8 +247,8 @@ void Client::init_lsquic() {
         fail("Initialization of the engine has failed");
     }
 
-    lsquic_set_log_level("debug");
-    lsquic_logger_init(&logger_if, stderr, LLTS_HHMMSSUS);
+//    lsquic_set_log_level("debug");
+//    lsquic_logger_init(&logger_if, stderr, LLTS_HHMMSSUS);
 
     ::lsquic_engine_settings settings{};
     ::lsquic_engine_init_settings(&settings, 0);
@@ -309,6 +292,13 @@ seastar::future<> Client::service_loop() {
     timer.set_callback([this] () {
         return timer_expired();
     });
+    
+    status_timer.set_callback([this] () {
+        ++seconds_elapsed;
+        std::cerr << "Download speed " << bytes_read / seconds_elapsed << " bytes/sec at core" << 
+            seastar::this_shard_id() << "\n";
+    });
+    status_timer.arm_periodic(std::chrono::seconds(1));
 
     conn = lsquic_engine_connect(engine, N_LSQVER, &channel.local_address().as_posix_sockaddr(),
                                  &server_address.as_posix_sockaddr(), this, nullptr, nullptr, 0,
@@ -320,11 +310,7 @@ seastar::future<> Client::service_loop() {
 
     (void) process_conns();
 
-    read_udp_future = read_udp();
-
-    return seastar::keep_doing([] {
-        return seastar::make_ready_future<>();
-    });
+    return read_udp();
 }
 
 
@@ -332,7 +318,7 @@ static seastar::future<> submit_to_cores(std::string &host, std::uint16_t port) 
     return seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
             [&host, &port] (unsigned core) {
         return seastar::smp::submit_to(core, [&host, &port] () {
-            Client _client(host, port);
+            Client _client(host, port + seastar::this_shard_id());
             return seastar::do_with(std::move(_client), [] (Client &client) {
                 client.init_lsquic();
                 return client.service_loop();

@@ -14,15 +14,16 @@ private:
     udp_channel channel;
     seastar::socket_address server_address;
     seastar::timer<> timer;
+    seastar::timer<> status_timer;
     seastar::future<> udp_send_queue;
     seastar::future<> read_udp_future;
     seastar::future<> client_flow_loop_future;
-    bool can_read_stdin = false;
     lsquic_engine_t *engine{};
     lsquic_conn_t *conn{};
     lsquic_stream_t *stream{};
-
-    seastar::future<> read_stdin_and_write_to_stream();
+    size_t bytes_read = 0;
+    size_t seconds_elapsed = 0;
+    
     seastar::future<> timer_expired();
     seastar::future<> process_conns();
 
