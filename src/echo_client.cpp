@@ -15,6 +15,7 @@ using namespace seastar::net;
 using namespace zpp;
 
 bool connection_closed = false;
+bool first_stream_shutdown = false;
 
 static int tut_log_buf (void *ctx, const char *buf, size_t len) {
     FILE *out = static_cast<FILE *>(ctx);
@@ -45,7 +46,9 @@ void Client::tut_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status
             break;
     }
     
-    for (size_t i = 0; i < 1000; ++i) {
+    static const size_t n_streams = 1;
+    std::cerr << "Creating " << n_streams << " streams" << std::endl;
+    for (size_t i = 0; i < n_streams; ++i) {
         lsquic_conn_make_stream(conn);
     }
 }
@@ -93,6 +96,12 @@ lsquic_stream_ctx_t* Client::tut_client_on_new_stream (void *stream_if_ctx, stru
 /* Echo whatever comes back from server, no verification */
 void Client::tut_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     static char buf[MAX_UDP_PAYLOAD_SIZE];
+    
+    if (first_stream_shutdown) {
+        lsquic_stream_wantread(stream, 0);
+        lsquic_stream_shutdown(stream, 0);
+        return;
+    }
 
     ssize_t nread = ::lsquic_stream_read(stream, buf, sizeof(buf));
 
@@ -130,6 +139,7 @@ void Client::tut_client_on_write (struct lsquic_stream *stream, lsquic_stream_ct
 
 void Client::tut_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     std::cerr << "stream closed\n";
+    first_stream_shutdown = true;
     free(h);
 }
 
